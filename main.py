@@ -1,502 +1,406 @@
-import customtkinter as ctk
-from functools import partial
-from scipy.signal import butter, lfilter
-import numpy as np
-import sounddevice as sd
-import threading
+from Modules.Libs.libs import *
+import tkinter as tk
+import math
 
-# Low-pass filter
-def low_pass_filter(data, cutoff, samplerate, resonance=1):
-    nyquist = 0.5 * samplerate
-    normal_cutoff = cutoff / nyquist
-    b, a = butter(resonance, normal_cutoff, btype='low', analog=False)
-    return lfilter(b, a, data)
-
-# High-pass filter
-def high_pass_filter(data, cutoff, samplerate, resonance=1):
-    nyquist = 0.5 * samplerate
-    normal_cutoff = cutoff / nyquist
-    b, a = butter(resonance, normal_cutoff, btype='high', analog=False)
-    return lfilter(b, a, data)
-
-# Band-pass filter
-def band_pass_filter(data, low_cutoff, high_cutoff, samplerate, resonance=1):
-    nyquist = 0.5 * samplerate
-    low = low_cutoff / nyquist
-    high = high_cutoff / nyquist
-    b, a = butter(resonance, [low, high], btype='band', analog=False)
-    return lfilter(b, a, data)
-
-# Precompute waveforms for all MIDI notes
-precomputed_waves = {}
-
-def precompute_waveforms():
-    for note in range(21, 109):  # MIDI range A0 (21) to C8 (108)
-        frequency = note_to_frequency(note)
-        duration = 0.5  # Fixed duration for precomputing
-        waveforms = {}  # A dictionary to hold waveforms for this note
-        # Precompute waveforms for each oscillator and ADSR setting
-        for waveform in ["Sine", "Square", "Sawtooth"]:
-            wave = generate_wave(waveform, frequency, duration)
-            # Apply ADSR envelope for oscillator 1 settings
-            wave = apply_adsr_envelope(
-                wave,
-                osc1_attack.get(),
-                osc1_decay.get(),
-                osc1_sustain.get(),
-                osc1_release.get(),
-                duration
-            )
-            waveforms[waveform] = wave  # Store the waveform for this type
-        precomputed_waves[note] = waveforms  # Store waveforms for this note
-
-# Sampling rate (samples per second)
-SAMPLE_RATE = 44100
-
-# Waveform generation functions
-def generate_sine_wave(frequency, duration, amplitude=1.0):
-    t = np.linspace(0, duration, int(SAMPLE_RATE * duration), endpoint=False)
-    return amplitude * np.sin(2 * np.pi * frequency * t)
-
-def generate_square_wave(frequency, duration, amplitude=1.0):
-    t = np.linspace(0, duration, int(SAMPLE_RATE * duration), endpoint=False)
-    return amplitude * np.sign(np.sin(2 * np.pi * frequency * t))
-
-def generate_sawtooth_wave(frequency, duration, amplitude=1.0):
-    t = np.linspace(0, duration, int(SAMPLE_RATE * duration), endpoint=False)
-    return amplitude * (2 * (t * frequency - np.floor(0.5 + t * frequency)))
-
-# ADSR Envelope generator
-def apply_adsr_envelope(wave, attack, decay, sustain, release, duration):
-    total_samples = len(wave)
-    attack_samples = int(attack * SAMPLE_RATE)
-    decay_samples = int(decay * SAMPLE_RATE)
-    sustain_samples = int((duration - attack - decay - release) * SAMPLE_RATE)
-    release_samples = int(release * SAMPLE_RATE)
-
-    # Generate envelope
-    envelope = np.zeros(total_samples)
-    if attack_samples > 0:
-        envelope[:attack_samples] = np.linspace(0, 1, attack_samples)
-    if decay_samples > 0:
-        envelope[attack_samples:attack_samples + decay_samples] = np.linspace(1, sustain, decay_samples)
-    if sustain_samples > 0:
-        envelope[attack_samples + decay_samples:attack_samples + decay_samples + sustain_samples] = sustain
-    if release_samples > 0:
-        envelope[-release_samples:] = np.linspace(sustain, 0, release_samples)
-
-    # Apply envelope to wave
-    return wave * envelope
-
-# Play generated wave with dynamic ADSR settings
-def play_wave_dynamic(wave, attack, decay, sustain, release, duration):
-    total_samples = len(wave)
-    attack_samples = int(attack * SAMPLE_RATE)
-    decay_samples = int(decay * SAMPLE_RATE)
-    release_samples = int(release * SAMPLE_RATE)
-    sustain_samples = total_samples - (attack_samples + decay_samples + release_samples)
-
-    # Generate ADSR envelope dynamically
-    def callback(outdata, frames, time, status):
-        if status:
-            print(status)  # Handle audio buffer errors (if any)
+class SynthApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("SynthPythor")
+        self.root.geometry("1200x850")
         
-        start_idx = callback.current_idx
-        end_idx = start_idx + frames
-        if end_idx > total_samples:
-            end_idx = total_samples
+        self._init_variables()
+        self._setup_gui()
+
+    def _init_variables(self):
+        # Voice 1 Variables (Osc 1 / Filter 1 / Env 1)
+        self.osc1_waveform = ctk.StringVar(value="Sawtooth")
+        self.osc1_detune = ctk.DoubleVar(value=0)  # cents
+        self.osc1_unison = ctk.IntVar(value=1)  # number of unison voices (1-7)
+        self.osc1_filter_attack = ctk.DoubleVar(value=0)
+        self.osc1_filter_decay = ctk.DoubleVar(value=0.25)
+        self.osc1_filter_sustain = ctk.DoubleVar(value=0)
+        self.osc1_filter_release = ctk.DoubleVar(value=0.13)
+        self.osc1_filter_type = ctk.StringVar(value="Low-pass")
+        self.osc1_cutoff = ctk.DoubleVar(value=2000)
+        self.osc1_resonance = ctk.DoubleVar(value=1.0) 
+
+        # Voice 2 Variables (Osc 2 / Filter 2 / Env 2)
+        self.osc2_enabled = ctk.BooleanVar(value=False)
+        self.osc2_waveform = ctk.StringVar(value="Sawtooth")
+        self.osc2_detune = ctk.DoubleVar(value=0)  # cents
+        self.osc2_unison = ctk.IntVar(value=1)  # number of unison voices (1-7)
+        self.osc2_filter_attack = ctk.DoubleVar(value=0)
+        self.osc2_filter_decay = ctk.DoubleVar(value=0.1)
+        self.osc2_filter_sustain = ctk.DoubleVar(value=0)
+        self.osc2_filter_release = ctk.DoubleVar(value=0.1)
+        self.osc2_filter_type = ctk.StringVar(value="Low-pass")
+        self.osc2_cutoff = ctk.DoubleVar(value=2000)
+        self.osc2_resonance = ctk.DoubleVar(value=1.0) 
+        self.osc2_mix = ctk.DoubleVar(value=50) # 0 to 100
+
+        # Amp Env Vairables
+        self.amp_attack = ctk.DoubleVar(value=0)
+        self.amp_decay = ctk.DoubleVar(value=0.1)
+        self.amp_sustain = ctk.DoubleVar(value=0)
+        self.amp_release = ctk.DoubleVar(value=0.1)
+
+    def play_note(self, note):
+        """Triggers note playback in a separate thread."""
         
-        # Apply ADSR envelope dynamically
-        envelope = np.zeros(frames)
-        for i in range(frames):
-            idx = start_idx + i
-            if idx < attack_samples:
-                envelope[i] = idx / attack_samples
-            elif idx < attack_samples + decay_samples:
-                envelope[i] = 1 - ((idx - attack_samples) / decay_samples) * (1 - sustain)
-            elif idx < attack_samples + decay_samples + sustain_samples:
-                envelope[i] = sustain
-            elif idx < total_samples:
-                envelope[i] = sustain - ((idx - (attack_samples + decay_samples + sustain_samples)) / release_samples) * sustain
-            else:
-                envelope[i] = 0
+        # Capture current state from GUI variables
+        state = {
+            'note': note,
+            'duration': 0.5,
+            'freq': note_to_frequency(note),
+            
+            'voice1_params': {
+                'waveform': self.osc1_waveform.get(),
+                'detune': self.osc1_detune.get(),
+                'unison': self.osc1_unison.get(),
+                'adsr_vars': {
+                    'attack': self.osc1_filter_attack.get(), 'decay': self.osc1_filter_decay.get(),
+                    'sustain': self.osc1_filter_sustain.get(), 'release': self.osc1_filter_release.get()
+                },
+                'filter_vars': {
+                    'filter_type': self.osc1_filter_type.get(),
+                    'cutoff': self.osc1_cutoff.get(), 'resonance': self.osc1_resonance.get()
+                }
+            },
+            
+            'use_voice2': self.osc2_enabled.get(),
+            'voice2_params': {
+                'waveform': self.osc2_waveform.get(),
+                'detune': self.osc2_detune.get(),
+                'unison': self.osc2_unison.get(),
+                'adsr_vars': {
+                    'attack': self.osc2_filter_attack.get(), 'decay': self.osc2_filter_decay.get(),
+                    'sustain': self.osc2_filter_sustain.get(), 'release': self.osc2_filter_release.get()
+                },
+                'filter_vars': {
+                    'filter_type': self.osc2_filter_type.get(),
+                    'cutoff': self.osc2_cutoff.get(), 'resonance': self.osc2_resonance.get()
+                }
+            },
+            # Amp ADSR (separate from filter ADSR)
+            'amp_adsr_vars': {
+                'attack': self.amp_attack.get(), 'decay': self.amp_decay.get(),
+                'sustain': self.amp_sustain.get(), 'release': self.amp_release.get()
+            },
+            'mix_level': self.osc2_mix.get() / 100.0
+        }
         
-        # Apply the envelope to the wave
-        outdata[:, 0] = wave[start_idx:end_idx] * envelope
-        callback.current_idx = end_idx
+        threading.Thread(target=self._play_in_thread, args=(state,)).start()
 
-        # Stop playback when all samples are played
-        if end_idx >= total_samples:
-            raise sd.CallbackStop
 
-    callback.current_idx = 0
+    def _play_in_thread(self, state):
+        """The core audio generation and mixing thread function."""
+        def generate_voice_with_unison(osc_params, filter_params, filter_adsr_vars, amp_adsr_vars, base_freq, duration):
+            """Generate a voice with optional unison (multiple slightly detuned oscillators)."""
+            unison_count = osc_params.get('unison', 1)
+            waveform = osc_params['waveform']
+            detune = osc_params['detune']
+            
+            # Generate unison voices
+            unison_waves = []
+            for i in range(unison_count):
+                # Spread unison voices in detune cents
+                # Voice 0 is at detune
+                # Other voices spread around base detune
+                if unison_count == 1:
+                    voice_detune = detune
+                else:
+                    spread = 30  # cents spread around center
+                    voice_detune = detune + (i - (unison_count - 1) / 2.0) * (spread / (unison_count - 1))
+                
+                detune_ratio = 2 ** (voice_detune / 1200.0)
+                freq = base_freq * detune_ratio
+                
+                osc = Oscillator(waveform)
+                raw_wave = osc.generate(freq, duration)
+                unison_waves.append(raw_wave)
+            
+            # Mix unison voices (average)
+            mixed_wave = np.mean(unison_waves, axis=0)
+            
+            # Apply filter
+            filter_obj = Filter(**filter_params)
+            filter_env_adsr = ADSR(**filter_adsr_vars)
+            filter_env = filter_env_adsr.get_envelope(duration, total_samples=len(mixed_wave))
+            cutoff_knob = clamp(filter_obj.cutoff, 20, MAX_FREQ)
+            min_cut = 20.0
+            cutoff_env = min_cut + filter_env * (cutoff_knob - min_cut)
+            filtered = filter_obj.apply(mixed_wave, cutoff_envelope=cutoff_env)
+            
+            # Apply amplitude ADSR
+            amp_adsr = ADSR(**amp_adsr_vars)
+            final = amp_adsr.apply_envelope(filtered, duration)
+            
+            return final
 
-    # Start the stream
-    with sd.OutputStream(samplerate=SAMPLE_RATE, channels=1, callback=callback):
-        sd.sleep(int(duration * 1000))
-
-# Convert MIDI note to frequency
-def note_to_frequency(note):
-    # A4 = 440 Hz, note number 69 in MIDI
-    A4 = 440.0
-    return A4 * 2**((note - 69) / 12.0)
-
-# Generate wave based on selected waveform
-def generate_wave(waveform, frequency, duration, amplitude=1.0):
-    if waveform == "Sine":
-        return generate_sine_wave(frequency, duration, amplitude)
-    elif waveform == "Square":
-        return generate_square_wave(frequency, duration, amplitude)
-    elif waveform == "Sawtooth":
-        return generate_sawtooth_wave(frequency, duration, amplitude)
-    else:
-        return np.zeros(int(SAMPLE_RATE * duration))  # Silence for invalid waveform
-
-# Function to play a note with two oscillators and ADSR envelopes
-def play_note(note):
-    def play_in_thread(
-        note, 
-        waveform1, 
-        osc1_adsr, 
-        osc1_filter_type, 
-        osc1_cutoff_freq, 
-        osc1_resonance_value,  # NEW
-        use_osc2, 
-        waveform2, 
-        osc2_adsr, 
-        osc2_filter_type, 
-        osc2_cutoff_freq, 
-        osc2_resonance_value,  # NEW
-        osc2_mix_value
-    ):
-        frequency = note_to_frequency(note)
-        duration = 0.5  # Fixed duration for simplicity
-
-        # Generate Oscillator 1 waveform
-        wave1 = generate_wave(waveform1, frequency, duration)
-        wave1 = apply_adsr_envelope(
-            wave1,
-            osc1_adsr['attack'],
-            osc1_adsr['decay'],
-            osc1_adsr['sustain'],
-            osc1_adsr['release'],
-            duration
+        # 1. Generate Voice 1 with unison
+        wave1 = generate_voice_with_unison(
+            state['voice1_params'],
+            state['voice1_params']['filter_vars'],
+            state['voice1_params']['adsr_vars'],
+            state['amp_adsr_vars'],
+            state['freq'],
+            state['duration']
         )
-        # Apply filter to Oscillator 1
-        if osc1_filter_type == "Low-pass":
-            wave1 = low_pass_filter(wave1, osc1_cutoff_freq, SAMPLE_RATE, osc1_resonance_value)
-        elif osc1_filter_type == "High-pass":
-            wave1 = high_pass_filter(wave1, osc1_cutoff_freq, SAMPLE_RATE, osc1_resonance_value)
-        elif osc1_filter_type == "Band-pass":
-            wave1 = band_pass_filter(wave1, osc1_cutoff_freq, osc1_cutoff_freq * 1.5, SAMPLE_RATE, osc1_resonance_value)
 
-        # Generate Oscillator 2 waveform if enabled
-        if use_osc2:
-            wave2 = generate_wave(waveform2, frequency, duration)
-            wave2 = apply_adsr_envelope(
-                wave2,
-                osc2_adsr['attack'],
-                osc2_adsr['decay'],
-                osc2_adsr['sustain'],
-                osc2_adsr['release'],
-                duration
+        # 2. Process Voice 2 and Mix
+        final_wave = wave1
+        if state['use_voice2']:
+            wave2 = generate_voice_with_unison(
+                state['voice2_params'],
+                state['voice2_params']['filter_vars'],
+                state['voice2_params']['adsr_vars'],
+                state['amp_adsr_vars'],
+                state['freq'],
+                state['duration']
             )
-            # Apply filter to Oscillator 2
-            if osc2_filter_type == "Low-pass":
-                wave2 = low_pass_filter(wave2, osc2_cutoff_freq, SAMPLE_RATE, osc2_resonance_value)
-            elif osc2_filter_type == "High-pass":
-                wave2 = high_pass_filter(wave2, osc2_cutoff_freq, SAMPLE_RATE, osc2_resonance_value)
-            elif osc2_filter_type == "Band-pass":
-                wave2 = band_pass_filter(wave2, osc2_cutoff_freq, osc2_cutoff_freq * 1.5, SAMPLE_RATE, osc2_resonance_value)
 
-            # Mix Oscillator 1 and Oscillator 2
-            wave = (1 - osc2_mix_value) * wave1 + osc2_mix_value * wave2
+            # Ensure same length for mixing
+            min_len = min(len(wave1), len(wave2))
+            wave1 = wave1[:min_len]
+            wave2 = wave2[:min_len]
+
+            mix_level = state['mix_level']
+            final_wave = (1.0 - mix_level) * wave1 + mix_level * wave2
+
+        # 3. Final normalization and playback
+        final_wave = normalize_wave(final_wave)
+        play_wave_dynamic(final_wave, state['duration'])
+
+
+    # --- GUI Helper Methods (Copied from previous implementation) ---
+
+    def _create_vertical_slider(self, parent_frame, row, col, label_text, variable, from_val, to_val):
+        slider = ctk.CTkSlider(
+            parent_frame, height=110, orientation="vertical", from_=from_val, to=to_val, variable=variable
+        )
+        slider.grid(row=row, column=col, padx=5, pady=5)
+        ctk.CTkLabel(parent_frame, text=label_text).grid(row=row + 1, column=col, padx=5, pady=5)
+
+    def _create_knob(self, parent_frame, row, col, label_text, variable, min_val, max_val, size=50):
+        """Creates a circular knob (tk.Canvas) that controls a DoubleVar between min_val and max_val."""
+        frame = ctk.CTkFrame(parent_frame, fg_color=parent_frame.cget('fg_color'))
+        frame.grid(row=row, column=col, padx=8, pady=8, sticky="ew")
+
+        ctk.CTkLabel(frame, text=label_text).pack()
+
+        # try to match the CTk frame background; fall back to a dark color
+        bg_color = '#2b2b2b'
+        try:
+            bg_color = parent_frame.cget('fg_color')
+        except Exception:
+            try:
+                bg_color = getattr(frame, '_fg_color', bg_color)
+            except Exception:
+                pass
+
+        canvas = tk.Canvas(frame, width=size, height=size, highlightthickness=0, bg=bg_color[1], bd=0, relief='raised')
+        canvas.pack()
+
+        cx = size / 2
+        cy = size / 2
+        radius = size * 0.36
+
+        # Draw knob circle (face slightly lighter than the background so it remains visible)
+        knob_face = '#333333'
+        canvas.create_oval(cx - radius, cy - radius, cx + radius, cy + radius, fill=knob_face, outline="#444444")
+
+        # Indicator line (will be updated)
+        line_len = radius * 0.8
+        # initial position for 0.0
+        angle = 0
+        x2 = cx + line_len * math.cos(angle)
+        y2 = cy - line_len * math.sin(angle)
+        indicator = canvas.create_line(cx, cy, x2, y2, width=3, fill="#00aaff")
+
+        # Value label
+        #val_label = ctk.CTkLabel(frame, text=str(variable.get()))
+        #val_label.pack(pady=(2, 0))
+
+        def value_to_angle(val):
+            # map value in [min_val, max_val] to an angle on a 270deg arc
+            # starting at bottom-left (225deg) and moving clockwise to cover 270deg.
+            # clockwise rotation increases the value.
+            frac = (val - min_val) / (max_val - min_val) if max_val > min_val else 0
+            start_deg = 225.0
+            arc = 270.0
+            deg = (start_deg - frac * arc) % 360.0
+            return math.radians(deg)
+
+        def angle_to_value(rad):
+            # Convert angle (radians) to degrees in [0,360)
+            deg = math.degrees(rad) % 360.0
+            start_deg = 225.0
+            arc = 270.0
+            diff = (start_deg - deg) % 360.0
+            if diff > arc:
+                diff = arc
+            frac = diff / arc
+            return min_val + frac * (max_val - min_val)
+
+        def update_visual_from_value(val):
+            ang = value_to_angle(val)
+            x2 = cx + line_len * math.cos(ang)
+            y2 = cy - line_len * math.sin(ang)
+            canvas.coords(indicator, cx, cy, x2, y2)
+            # update numeric label
+            # format: integer for cutoff, 2 decimals for Q
+            #if max_val > 100:
+            #    val_label.configure(text=str(int(val)))
+            #else:
+            #    val_label.configure(text=f"{val:.2f}")
+
+        def on_motion(event):
+            # compute angle from center
+            dx = event.x - cx
+            dy = cy - event.y
+            ang = math.atan2(dy, dx)
+            new_val = angle_to_value(ang)
+            # clamp
+            new_val = max(min_val, min(max_val, new_val))
+            try:
+                variable.set(new_val)
+            except Exception:
+                pass
+
+        def on_button_press(event):
+            on_motion(event)
+
+        # bind mouse events
+        canvas.bind("<B1-Motion>", on_motion)
+        canvas.bind("<Button-1>", on_button_press)
+
+        # trace variable changes to update visual
+        try:
+            variable.trace_add('write', lambda *args: update_visual_from_value(variable.get()))
+        except Exception:
+            # older tkinter
+            variable.trace('w', lambda *args: update_visual_from_value(variable.get()))
+
+        # initialize visual
+        update_visual_from_value(variable.get())
+
+        return frame
+
+    def _create_adsr_sliders(self, parent_frame, attack_var, decay_var, sustain_var, release_var):
+        adsr_vars = [
+            (attack_var, "Att"), (decay_var, "Dec"), 
+            (sustain_var, "Sus"), (release_var, "Rel")
+        ]
+        for i, (var, text) in enumerate(adsr_vars):
+            ctk.CTkSlider(
+                parent_frame, height=110, orientation="vertical", from_=0.0, to=1.0, variable=var
+            ).grid(row=1, column=i, padx=5, pady=5)
+            ctk.CTkLabel(parent_frame, text=text).grid(row=2, column=i, padx=5, pady=5)
+            
+    def _create_oscillator_frame(self, parent_frame, row, col, label, waveform_var, detune_var, unison_var, enabled_var=None, mix_var=None):
+        frame = ctk.CTkFrame(parent_frame)
+        frame.grid(row=row, column=col, padx=10, pady=10, sticky="nsew")
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_columnconfigure(1, weight=1)
+        
+        # Title (spans all columns)
+        ctk.CTkLabel(frame, text=label, font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
+        
+        # Waveform menu (spans all columns)
+        ctk.CTkOptionMenu(frame, width=170, values=["Sine", "Square", "Square*4", "Square*8", "Square*16", "Sawtooth", "Sawtooth*4", "Sawtooth*8", "Sawtooth*16"], variable=waveform_var).grid(row=1, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
+        
+        if enabled_var:
+            # Enable checkbox (spans all columns)
+            ctk.CTkCheckBox(frame, text="Enable Voice", variable=enabled_var).grid(row=2, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
+            
+            # Mix slider (spans all columns)
+            ctk.CTkLabel(frame, text="Mix (%)").grid(row=3, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
+            ctk.CTkSlider(frame, orientation="horizontal", from_=0, to=100, variable=mix_var).grid(row=4, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
+            
+            # Detune knob (left) - row 5
+            self._create_knob(frame, 5, 0, "Detune (¢)", detune_var, -100, 100, size=50)
+            
+            # Unison knob (right) - row 5
+            self._create_knob(frame, 5, 1, "Unison", unison_var, 1, 7, size=50)
         else:
-            wave = wave1  # Only Oscillator 1 is active
+            # Detune knob (left) - row 2
+            self._create_knob(frame, 2, 0, "Detune (¢)", detune_var, -100, 100, size=50)
+            
+            # Unison knob (right) - row 2
+            self._create_knob(frame, 2, 1, "Unison", unison_var, 1, 7, size=50)
 
-        # Play the resulting waveform with dynamic ADSR
-        play_wave_dynamic(
-            wave,
-            osc1_adsr['attack'],
-            osc1_adsr['decay'],
-            osc1_adsr['sustain'],
-            osc1_adsr['release'],
-            duration
-        )
+    def _create_filter_frame(self, parent_frame, row, col, label, type_var, cutoff_var, resonance_var):
+        frame = ctk.CTkFrame(parent_frame)
+        frame.grid(row=row, column=col, padx=10, pady=10, sticky="n")
+        ctk.CTkLabel(frame, text=label, font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, columnspan=3, padx=10, pady=5)
+        ctk.CTkOptionMenu(frame, values=["None", "Low-pass", "High-pass", "Band-pass"], variable=type_var
+        ).grid(row=1, column=0, columnspan=3, padx=5, pady=5)
+        # Replace vertical sliders with turnable knobs
+        self._create_knob(frame, 2, 0, "Freq (Hz)", cutoff_var, 20, 20000)
+        self._create_knob(frame, 2, 1, "Res (Q)", resonance_var, 1, 10)
+        ctk.CTkLabel(frame, text="").grid(row=3, column=2, rowspan=2, padx=5)
 
-    # Capture the current state of all variables
-    waveform1 = osc1_waveform.get()
-    osc1_adsr = {
-        'attack': osc1_attack.get(),
-        'decay': osc1_decay.get(),
-        'sustain': osc1_sustain.get(),
-        'release': osc1_release.get()
-    }
-    selected_osc1_filter_type = osc1_filter_type.get()
-    osc1_cutoff_freq = osc1_cutoff.get()
-    osc1_resonance_value = osc1_resonance.get()
+    def _create_adsr_frame(self, parent_frame, row, col, label, attack_var, decay_var, sustain_var, release_var):
+        frame = ctk.CTkFrame(parent_frame)
+        frame.grid(row=row, column=col, padx=10, pady=10, sticky="n")
+        ctk.CTkLabel(frame, text=label, font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, columnspan=4, padx=10, pady=5)
+        self._create_adsr_sliders(frame, attack_var, decay_var, sustain_var, release_var)
 
-    use_osc2 = osc2_enabled.get()
-    waveform2 = osc2_waveform.get()
-    osc2_adsr = {
-        'attack': osc2_attack.get(),
-        'decay': osc2_decay.get(),
-        'sustain': osc2_sustain.get(),
-        'release': osc2_release.get()
-    }
-    selected_osc2_filter_type = osc2_filter_type.get()
-    osc2_cutoff_freq = osc2_cutoff.get()
-    osc2_resonance_value = osc2_resonance.get()
-    osc2_mix_value = osc2_mix.get() / 100.0  # Convert to percentage
+    def _create_piano_keys(self, piano_frame):
+        white_keys = [
+            ("C", 48), ("D", 50), ("E", 52), ("F", 53), ("G", 55), ("A", 57), ("B", 59),
+            ("C", 60), ("D", 62), ("E", 64), ("F", 65), ("G", 67), ("A", 69), ("B", 71),
+            ("C", 72), ("D", 74), ("E", 76), ("F", 77), ("G", 79), ("A", 81), ("B", 83),
+            ("C", 84), ("D", 86), ("E", 88), ("F", 89), ("G", 91), ("A", 93), ("B", 95)
+        ]
+        black_keys = [
+            ("C#", 49), ("D#", 51), None, ("F#", 54), ("G#", 56), ("A#", 58), None,
+            ("C#", 61), ("D#", 63), None, ("F#", 66), ("G#", 68), ("A#", 70), None,
+            ("C#", 73), ("D#", 75), None, ("F#", 78), ("G#", 80), ("A#", 82), None,
+            ("C#", 85), ("D#", 87), None, ("F#", 90), ("G#", 92), ("A#", 94), None
+        ]
+        for i, (key, midi_note) in enumerate(white_keys):
+            button = ctk.CTkButton(
+                piano_frame, text="", command=partial(self.play_note, midi_note),
+                width=50, height=150, fg_color="white", text_color="black", corner_radius=0
+            )
+            button.grid(row=0, column=i, padx=0, pady=0, sticky="n")
+        for i, key_data in enumerate(black_keys):
+            if key_data is None: continue
+            key, midi_note = key_data
+            button = ctk.CTkButton(
+                piano_frame, text="", command=partial(self.play_note, midi_note),
+                width=30, height=100, fg_color="black", text_color="white", corner_radius=0
+            )
+            button.place(x=(50 * i + 35), y=0) 
 
-    # Start playback in a separate thread, passing captured state
-    threading.Thread(
-        target=play_in_thread,
-        args=(
-            note, 
-            waveform1, 
-            osc1_adsr, 
-            selected_osc1_filter_type, 
-            osc1_cutoff_freq, 
-            osc1_resonance_value,
-            use_osc2, 
-            waveform2, 
-            osc2_adsr, 
-            selected_osc2_filter_type, 
-            osc2_cutoff_freq, 
-            osc2_resonance_value, 
-            osc2_mix_value
-        )
-    ).start()
+    def _setup_gui(self):
+        controls_frame = ctk.CTkFrame(self.root)
+        controls_frame.pack(pady=10, padx=10, fill="both")
 
-# Initialize customtkinter
-ctk.set_appearance_mode("dark")  # Modes: "System" (default), "Dark", "Light"
-ctk.set_default_color_theme("blue")  # Themes: "blue" (default), "green", "dark-blue"
+        self._create_oscillator_frame(controls_frame, 0, 0, "Oscillator 1", self.osc1_waveform, self.osc1_detune, self.osc1_unison)
+        self._create_filter_frame(controls_frame, 0, 1, "Filter 1", self.osc1_filter_type, self.osc1_cutoff, self.osc1_resonance)
+        self._create_adsr_frame(controls_frame, 0, 3, "Filter 1 Env", self.osc1_filter_attack, self.osc1_filter_decay, self.osc1_filter_sustain, self.osc1_filter_release)
 
-# Create the main application window
-root = ctk.CTk()
-root.title("Mike T")
-root.geometry("1200x600")
+        self._create_oscillator_frame(controls_frame, 1, 0, "Oscillator 2", self.osc2_waveform, self.osc2_detune, self.osc2_unison, self.osc2_enabled, self.osc2_mix)
+        self._create_filter_frame(controls_frame, 0, 2, "Filter 2", self.osc2_filter_type, self.osc2_cutoff, self.osc2_resonance)
+        self._create_adsr_frame(controls_frame, 0, 4, "Filter 2 Env", self.osc2_filter_attack, self.osc2_filter_decay, self.osc2_filter_sustain, self.osc2_filter_release)
 
-# Main control frame
-controls_frame = ctk.CTkFrame(root)
-controls_frame.pack(pady=10, fill="x")
+        self._create_adsr_frame(controls_frame,0, 5, "Amp Env", self.amp_attack, self.amp_decay, self.amp_sustain, self.amp_release)
+        
+        # Make controls_frame height dynamic to match content
+        controls_frame.update_idletasks()
+        controls_frame.configure(height=controls_frame.winfo_reqheight())
+        
+        piano_frame = ctk.CTkFrame(self.root, height=150)
+        piano_frame.pack(side="bottom", fill="x")
+        self._create_piano_keys(piano_frame)
 
-# Oscillator 1 Section
-osc1_frame = ctk.CTkFrame(controls_frame, height=200, width=200)  # Matching dimensions
-osc1_frame.grid(row=0, column=0, padx=10, pady=10, sticky="w")
-
-osc1_label = ctk.CTkLabel(osc1_frame, text="Oscillator 1")
-osc1_label.pack(pady=5)
-osc1_waveform = ctk.StringVar(value="Sine")  # Default waveform
-osc1_dropdown = ctk.CTkOptionMenu(osc1_frame, width=200, values=["Sine", "Square", "Sawtooth"], variable=osc1_waveform)
-osc1_dropdown.pack(pady=5, padx=15)
-
-# Filter for osc1
-filter1_frame = ctk.CTkFrame(controls_frame)
-filter1_frame.grid(row=0, column=1, padx=10, pady=10, sticky="w")
-ctk.CTkLabel(filter1_frame, text="Filter 1").grid(row=0, padx=10, pady=10)
-osc1_filter_frame = ctk.CTkFrame(filter1_frame)
-osc1_filter_frame.grid(row=1)
-
-osc1_filter_type = ctk.StringVar(value="None")  # Default filter type
-osc1_filter_dropdown = ctk.CTkOptionMenu(
-    osc1_filter_frame, 
-    values=["None", "Low-pass", "High-pass", "Band-pass"], 
-    variable=osc1_filter_type
-)
-osc1_filter_dropdown.grid(rowspan=2, row=0, column=0, padx=5, pady=5, sticky="n")
-
-osc1_cutoff = ctk.DoubleVar(value=1000)  # Default cutoff frequency
-osc1_cutoff_slider = ctk.CTkSlider(
-    osc1_filter_frame, 
-    height=110,
-    orientation="vertical",
-    from_=20, 
-    to=20000, 
-    variable=osc1_cutoff
-)
-osc1_cutoff_slider.grid(row=0, column=1, padx=5, pady=5)
-
-osc1_cutoff_label = ctk.CTkLabel(osc1_filter_frame, text="Cut")
-osc1_cutoff_label.grid(row=1, column=1, padx=5, pady=5)
-
-osc1_resonance = ctk.DoubleVar(value=1)  # Default resonance is 1
-osc1_resonance_slider = ctk.CTkSlider(
-    osc1_filter_frame,
-    height=110,
-    orientation="vertical",
-    from_=1,  # Minimum resonance (1 is the default)
-    to=10,    # Maximum resonance (adjust as needed)
-    variable=osc1_resonance
-)
-osc1_resonance_slider.grid(row=0, column=2, padx=5, pady=5)
-
-osc1_resonance_label = ctk.CTkLabel(osc1_filter_frame, text="Res")
-osc1_resonance_label.grid(row=1, column=2, padx=5, pady=5)
-
-# ADSR sliders for Oscillator 1
-env1_frame = ctk.CTkFrame(controls_frame)
-env1_frame.grid(row=0, column=3, padx=10, pady=10, sticky="w")
-ctk.CTkLabel(env1_frame, text="Envelope 1").grid(row=0, padx=10, pady=10)
-osc1_adsr_frame = ctk.CTkFrame(env1_frame)
-osc1_adsr_frame.grid(row=1)
-
-osc1_attack = ctk.DoubleVar(value=0.1)
-osc1_decay = ctk.DoubleVar(value=0.1)
-osc1_sustain = ctk.DoubleVar(value=0.8)
-osc1_release = ctk.DoubleVar(value=0.3)
-
-ctk.CTkSlider(osc1_adsr_frame, height=110, orientation="vertical", from_=0, to=1, variable=osc1_attack).grid(row=0, column=0, padx=5, pady=5)
-ctk.CTkSlider(osc1_adsr_frame, height=110, orientation="vertical", from_=0, to=1, variable=osc1_decay).grid(row=0, column=1, padx=5, pady=5)
-ctk.CTkSlider(osc1_adsr_frame, height=110, orientation="vertical", from_=0, to=1, variable=osc1_sustain).grid(row=0, column=2, padx=5, pady=5)
-ctk.CTkSlider(osc1_adsr_frame, height=110, orientation="vertical", from_=0, to=1, variable=osc1_release).grid(row=0, column=3, padx=5, pady=5)
-
-ctk.CTkLabel(osc1_adsr_frame, text="Att").grid(row=1, column=0, padx=5, pady=5)
-ctk.CTkLabel(osc1_adsr_frame, text="Dec").grid(row=1, column=1, padx=5, pady=5)
-ctk.CTkLabel(osc1_adsr_frame, text="Sus").grid(row=1, column=2, padx=5, pady=5)
-ctk.CTkLabel(osc1_adsr_frame, text="Rel").grid(row=1, column=3, padx=5, pady=5)
-
-# Spacer to balance the frame
-osc1_spacer = ctk.CTkLabel(osc1_frame, text="")  # Empty label as a spacer
-osc1_spacer.pack(pady=50)  # Add padding to match Oscillator 2 height
-
-# Oscillator 2 Section
-osc2_frame = ctk.CTkFrame(controls_frame, height=200, width=200)  # Matching dimensions
-osc2_frame.grid(row=1, column=0, padx=10, pady=10, sticky="w")
-
-osc2_label = ctk.CTkLabel(osc2_frame, text="Oscillator 2")
-osc2_label.pack(pady=5, padx=10)
-osc2_waveform = ctk.StringVar(value="Sine")  # Default waveform
-osc2_dropdown = ctk.CTkOptionMenu(osc2_frame, width=200, values=["Sine", "Square", "Sawtooth"], variable=osc2_waveform)
-osc2_dropdown.pack(pady=5, padx=15)
-
-osc2_enabled = ctk.BooleanVar(value=False)
-osc2_checkbox = ctk.CTkCheckBox(osc2_frame, text="Enable Oscillator 2", variable=osc2_enabled)
-osc2_checkbox.pack(pady=5)
-
-# Oscillator 2 mix slider
-osc2_mix_label = ctk.CTkLabel(osc2_frame, text="Oscillator 2 Mix:")
-osc2_mix_label.pack(pady=5, padx=10)
-osc2_mix = ctk.DoubleVar(value=50)  # Default mix is 50%
-osc2_mix_slider = ctk.CTkSlider(osc2_frame, orientation="horizontal", from_=0, to=100, variable=osc2_mix)
-osc2_mix_slider.pack(pady=5)
-
-# Filter for osc2
-filter2_frame = ctk.CTkFrame(controls_frame)
-filter2_frame.grid(row=0, column=2, padx=10, pady=10, sticky="w")
-ctk.CTkLabel(filter2_frame, text="Filter 2").grid(row=0, padx=10, pady=10)
-osc2_filter_frame = ctk.CTkFrame(filter2_frame)
-osc2_filter_frame.grid(row=1)
-
-osc2_filter_type = ctk.StringVar(value="None")  # Default filter type
-osc2_filter_dropdown = ctk.CTkOptionMenu(
-    osc2_filter_frame, 
-    values=["None", "Low-pass", "High-pass", "Band-pass"], 
-    variable=osc2_filter_type
-)
-osc2_filter_dropdown.grid(rowspan=2, row=0, column=0, padx=5, pady=5, sticky="n")
-
-osc2_cutoff = ctk.DoubleVar(value=1000)  # Default cutoff frequency
-osc2_cutoff_slider = ctk.CTkSlider(
-    osc2_filter_frame, 
-    height=110,
-    orientation="vertical",
-    from_=20, 
-    to=20000, 
-    variable=osc2_cutoff
-)
-osc2_cutoff_slider.grid(row=0, column=1, padx=5, pady=5)
-
-osc2_cutoff_label = ctk.CTkLabel(osc2_filter_frame, text="Cut")
-osc2_cutoff_label.grid(row=1, column=1, padx=5, pady=5)
-
-osc2_resonance = ctk.DoubleVar(value=1)  # Default resonance is 1
-osc2_resonance_slider = ctk.CTkSlider(
-    osc2_filter_frame,
-    height=110,
-    orientation="vertical",
-    from_=1,  # Minimum resonance (1 is the default)
-    to=10,    # Maximum resonance (adjust as needed)
-    variable=osc2_resonance
-)
-osc2_resonance_slider.grid(row=0, column=2, padx=5, pady=5)
-
-osc2_resonance_label = ctk.CTkLabel(osc2_filter_frame, text="Res")
-osc2_resonance_label.grid(row=1, column=2, padx=5, pady=5)
-
-# ADSR sliders for Oscillator 2
-env2_frame = ctk.CTkFrame(controls_frame)
-env2_frame.grid(row=0, column=4, padx=10, pady=10, sticky="w")
-ctk.CTkLabel(env2_frame, text="Envelope 2").grid(row=0, padx=10, pady=10)
-osc2_adsr_frame = ctk.CTkFrame(env2_frame)
-osc2_adsr_frame.grid(row=1)
-
-osc2_attack = ctk.DoubleVar(value=0.1)
-osc2_decay = ctk.DoubleVar(value=0.1)
-osc2_sustain = ctk.DoubleVar(value=0.8)
-osc2_release = ctk.DoubleVar(value=0.3)
-
-ctk.CTkSlider(osc2_adsr_frame, height=110, orientation="vertical", from_=0, to=1, variable=osc2_attack).grid(row=0, column=0, padx=5, pady=5)
-ctk.CTkSlider(osc2_adsr_frame, height=110, orientation="vertical", from_=0, to=1, variable=osc2_decay).grid(row=0, column=1, padx=5, pady=5)
-ctk.CTkSlider(osc2_adsr_frame, height=110, orientation="vertical", from_=0, to=1, variable=osc2_sustain).grid(row=0, column=2, padx=5, pady=5)
-ctk.CTkSlider(osc2_adsr_frame, height=110, orientation="vertical", from_=0, to=1, variable=osc2_release).grid(row=0, column=3, padx=5, pady=5)
-
-ctk.CTkLabel(osc2_adsr_frame, text="Att").grid(row=1, column=0, padx=5, pady=5)
-ctk.CTkLabel(osc2_adsr_frame, text="Dec").grid(row=1, column=1, padx=5, pady=5)
-ctk.CTkLabel(osc2_adsr_frame, text="Sus").grid(row=1, column=2, padx=5, pady=5)
-ctk.CTkLabel(osc2_adsr_frame, text="Rel").grid(row=1, column=3, padx=5, pady=5)
-
-# Piano Frame
-piano_frame = ctk.CTkFrame(root, width=1200, height=150)
-piano_frame.pack(side="bottom", fill="x")
-
-# Define piano keys
-white_keys = [
-    ("C", 48), ("D", 50), ("E", 52), ("F", 53), ("G", 55), ("A", 57), ("B", 59),
-    ("C", 60), ("D", 62), ("E", 64), ("F", 65), ("G", 67), ("A", 69), ("B", 71),
-    ("C", 72), ("D", 74), ("E", 76), ("F", 77), ("G", 79), ("A", 81), ("B", 83),
-    ("C", 84), ("D", 86), ("E", 88), ("F", 89), ("G", 91), ("A", 93), ("B", 95)
-]
-black_keys = [
-    ("C#", 49), ("D#", 51), None, ("F#", 54), ("G#", 56), ("A#", 58), None,
-    ("C#", 61), ("D#", 63), None, ("F#", 66), ("G#", 68), ("A#", 70), None,
-    ("C#", 73), ("D#", 75), None, ("F#", 78), ("G#", 80), ("A#", 82), None,
-    ("C#", 85), ("D#", 87), None, ("F#", 90), ("G#", 92), ("A#", 94), None
-]
-
-# Add white keys
-for i, (key, midi_note) in enumerate(white_keys):
-    button = ctk.CTkButton(
-        piano_frame,
-        text=key,
-        command=partial(play_note, midi_note),
-        width=50,
-        height=150,
-        fg_color="white",
-        text_color="black",
-        corner_radius=0
-    )
-    button.grid(row=0, column=i, padx=0, pady=0, sticky="n")
-
-# Add black keys
-for i, key_data in enumerate(black_keys):
-    if key_data is None:
-        continue  # Skip spaces where there are no black keys
-    key, midi_note = key_data
-    button = ctk.CTkButton(
-        piano_frame,
-        text=key,
-        command=partial(play_note, midi_note),
-        width=30,
-        height=100,
-        fg_color="black",
-        text_color="white",
-        corner_radius=0
-    )
-    # Position black keys slightly offset above white keys
-    button.place(x=(50 * i + 35), y=0)  # Offset black keys horizontally and vertically
-
-# Run the application
-precompute_waveforms()
-root.mainloop()
+if __name__ == "__main__":
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("blue")
+    
+    root = ctk.CTk()
+    app = SynthApp(root)
+    
+    root.mainloop()
